@@ -465,7 +465,7 @@ mod tests {
             .alpns(vec![ALPN.to_vec()])
             .bind()
             .await?;
-        let alice_addr = alice.node_addr().initialized().await?;
+        let alice_addr = alice.node_addr().initialized().await;
 
         let alice_fut = async move {
             let conn = alice.accept().await.ok_or(anyhow!("no conn"))?.await?;
@@ -509,7 +509,7 @@ mod tests {
             .alpns(vec![ALPN.to_vec()])
             .bind()
             .await?;
-        let alice_addr = alice.node_addr().initialized().await?;
+        let alice_addr = alice.node_addr().initialized().await;
 
         let alice_fut = async move {
             let conn = alice.accept().await.ok_or(anyhow!("no conn"))?.await?;
@@ -553,7 +553,7 @@ mod tests {
             .alpns(vec![ALPN.to_vec()])
             .bind()
             .await?;
-        let alice_addr = alice.node_addr().initialized().await?;
+        let alice_addr = alice.node_addr().initialized().await;
 
         let alice_fut = async move {
             let conn = alice.accept().await.ok_or(anyhow!("no conn"))?.await?;
@@ -599,7 +599,7 @@ mod tests {
             .alpns(vec![ALPN.to_vec()])
             .bind()
             .await?;
-        let alice_addr = alice.node_addr().initialized().await?;
+        let alice_addr = alice.node_addr().initialized().await;
 
         let alice_fut = async move {
             let conn = alice.accept().await.ok_or(anyhow!("no conn"))?.await?;
@@ -641,7 +641,7 @@ mod tests {
             .alpns(vec![ALPN.to_vec()])
             .bind()
             .await?;
-        let alice_addr = alice.node_addr().initialized().await?;
+        let alice_addr = alice.node_addr().initialized().await;
 
         let alice_fut = async move {
             let conn = alice.accept().await.ok_or(anyhow!("no conn"))?.await?;
@@ -681,7 +681,7 @@ mod tests {
             .alpns(vec![ALPN.to_vec()])
             .bind()
             .await?;
-        let alice_addr = alice.node_addr().initialized().await?;
+        let alice_addr = alice.node_addr().initialized().await;
 
         let alice_fut = async move {
             let conn = alice.accept().await.ok_or(anyhow!("no conn"))?.await?;
@@ -725,7 +725,10 @@ mod tests {
 
             // Sending does not work since remote has closed.
             let res = stream.send_msg(b"hello".as_ref().into()).await;
-            assert!(matches!(res, Err(StreamError::RemoteClosed)));
+            assert!(
+                matches!(res, Err(StreamError::RemoteClosed)),
+                "got: {res:?}"
+            );
 
             stream.close().await?;
             conn.close().await?;
@@ -747,7 +750,7 @@ mod tests {
             .alpns(vec![ALPN.to_vec()])
             .bind()
             .await?;
-        let alice_addr = alice.node_addr().initialized().await?;
+        let alice_addr = alice.node_addr().initialized().await;
 
         let alice_fut = async move {
             let conn = alice.accept().await.ok_or(anyhow!("no conn"))?.await?;
@@ -814,7 +817,7 @@ mod tests {
             .alpns(vec![ALPN.to_vec()])
             .bind()
             .await?;
-        let alice_addr = alice.node_addr().initialized().await?;
+        let alice_addr = alice.node_addr().initialized().await;
 
         let alice_fut = async move {
             let conn = alice.accept().await.ok_or(anyhow!("no conn"))?.await?;
@@ -880,7 +883,7 @@ mod tests {
             .alpns(vec![ALPN.to_vec()])
             .bind()
             .await?;
-        let alice_addr = alice.node_addr().initialized().await?;
+        let alice_addr = alice.node_addr().initialized().await;
 
         let alice_fut = async move {
             let conn = alice.accept().await.ok_or(anyhow!("no conn"))?.await?;
