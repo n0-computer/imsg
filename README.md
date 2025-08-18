@@ -1,6 +1,23 @@
 # iroh messages
 
-> A base protocol providing streams of messages
+A base protocol providing streams of messages.
+
+The purpose of imsg is to be a building block for your own protocol.
+It simplifies handling a full-blown QUIC connection with all its
+subtelties into having a protocol which sends and receives messages.
+
+The short summary of the features is:
+
+- Always send and receive an entire message, as a `Bytes` object.
+- Either side can send the first message.
+- When closing a connection, it is easy to reason about which message
+  may be lost.
+
+
+## Work In Progress
+
+This is currently highly experimental and more a prototype under
+development.
 
 
 ## License
