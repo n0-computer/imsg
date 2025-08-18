@@ -20,4 +20,5 @@ tokio-util = { version = "0.7.15", features = ["codec"] }
 tracing = "0.1.41"
 
 [dev-dependencies]
+assert2 = "0.3.16"
 testresult = "0.4.1"

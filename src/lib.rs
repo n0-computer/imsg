@@ -404,6 +404,7 @@ impl From<iroh::endpoint::StreamId> for Side {
 #[cfg(test)]
 mod tests {
     use anyhow::anyhow;
+    use assert2::check;
     use iroh::{Endpoint, Watcher};
     use testresult::TestResult;
     use tracing::{Instrument, info_span};
@@ -488,7 +489,7 @@ mod tests {
             let stream = conn.open_stream().await?;
             stream.send_msg(b"hello".as_ref().into()).await?;
             let msg = stream.recv_msg().await?;
-            assert_eq!(&msg, b"hello".as_ref());
+            check!(&msg == b"hello".as_ref());
             stream.close().await?;
             conn.close().await?;
 
@@ -532,7 +533,7 @@ mod tests {
             let stream = conn.open_stream().await?;
             stream.send_msg(b"hello".as_ref().into()).await?;
             let msg = stream.recv_msg().await?;
-            assert_eq!(&msg, b"hello".as_ref());
+            check!(&msg == b"hello".as_ref());
             // Not closing the stream!
             conn.close().await?;
 
@@ -577,7 +578,7 @@ mod tests {
             let stream = conn.open_stream().await?;
             stream.send_msg(b"hello".as_ref().into()).await?;
             let msg = stream.recv_msg().await?;
-            assert_eq!(&msg, b"hello".as_ref());
+            check!(&msg == b"hello".as_ref());
             stream.close().await?;
             // Dropping the connection without closing.  No message lost because we awaited
             // the stream.  A warning is logged.
@@ -621,7 +622,7 @@ mod tests {
             let stream = conn.open_stream().await?;
             stream.send_msg(b"hello".as_ref().into()).await?;
             let msg = stream.recv_msg().await?;
-            assert_eq!(&msg, b"hello".as_ref());
+            check!(&msg == b"hello".as_ref());
             // Not closing the stream, dropping the connection results in an error message.
 
             Ok::<_, testresult::TestError>(())
@@ -661,7 +662,7 @@ mod tests {
             let conn = Connection::new(conn).await?;
             let stream = conn.open_stream().await?;
             let msg = stream.recv_msg().await?;
-            assert_eq!(&msg, b"hello".as_ref());
+            check!(&msg == b"hello".as_ref());
             conn.close().await?;
 
             Ok::<_, testresult::TestError>(())
@@ -697,11 +698,11 @@ mod tests {
 
             // Sending now results in a closed error
             let res = stream.send_msg(b"hello".as_ref().into()).await;
-            assert!(matches!(res, Err(StreamError::Closed)));
+            check!(let Err(StreamError::Closed) = res);
 
             // For implementation reasons, check this result is consistent.
             let res = stream.send_msg(b"hello".as_ref().into()).await;
-            assert!(matches!(res, Err(StreamError::Closed)));
+            check!(let Err(StreamError::Closed) = res);
 
             conn.close().await?;
 
@@ -717,18 +718,15 @@ mod tests {
 
             // First read a message
             let msg = stream.recv_msg().await?;
-            assert_eq!(&msg, b"hello".as_ref());
+            check!(&msg == b"hello".as_ref());
 
             // Now read end-of-stream
             let res = stream.recv_msg().await;
-            assert!(matches!(res, Err(StreamError::EndOfStream)));
+            check!(let Err(StreamError::EndOfStream) = res);
 
             // Sending does not work since remote has closed.
             let res = stream.send_msg(b"hello".as_ref().into()).await;
-            assert!(
-                matches!(res, Err(StreamError::RemoteClosed)),
-                "got: {res:?}"
-            );
+            check!(let Err(StreamError::RemoteClosed) = res);
 
             stream.close().await?;
             conn.close().await?;
@@ -779,26 +777,26 @@ mod tests {
 
             // Read last stream first
             let msg = stream2.recv_msg().await?;
-            assert_eq!(&msg, b"hello 2".as_ref());
+            check!(&msg == b"hello 2".as_ref());
 
             // Now we can't send on other streams
             let res = stream0.send_msg(b"msg".as_ref().into()).await;
-            assert!(matches!(res, Err(StreamError::RemoteClosed)));
+            check!(let Err(StreamError::RemoteClosed) = res);
             let res = stream1.send_msg(b"msg".as_ref().into()).await;
-            assert!(matches!(res, Err(StreamError::RemoteClosed)));
+            check!(let Err(StreamError::RemoteClosed) = res);
 
             // Drain stream0
             let msg = stream0.recv_msg().await?;
-            assert_eq!(&msg, b"hello 0".as_ref());
+            check!(&msg == b"hello 0".as_ref());
             let res = stream0.recv_msg().await;
-            assert!(matches!(res, Err(StreamError::EndOfStream)));
+            check!(let Err(StreamError::EndOfStream) = res);
 
             // Close without draining stream1
             conn.close().await?;
 
             // Stream1 is now closed
             let res = stream1.recv_msg().await;
-            assert!(matches!(res, Err(StreamError::Closed)));
+            check!(let Err(StreamError::Closed) = res);
 
             Ok::<_, testresult::TestError>(())
         }
@@ -829,14 +827,14 @@ mod tests {
 
             // Sending and receiving from the stream should result in errors.
             let res = stream.send_msg(b"hello".as_ref().into()).await;
-            assert!(matches!(res, Err(StreamError::Aborted)));
+            check!(let Err(StreamError::Aborted) = res);
             let res = stream.send_msg(b"hello".as_ref().into()).await;
-            assert!(matches!(res, Err(StreamError::Aborted)));
+            check!(let Err(StreamError::Aborted) = res);
 
             let res = stream.recv_msg().await;
-            assert!(matches!(res, Err(StreamError::Aborted)));
+            check!(let Err(StreamError::Aborted) = res);
             let res = stream.recv_msg().await;
-            assert!(matches!(res, Err(StreamError::Aborted)));
+            check!(let Err(StreamError::Aborted) = res);
 
             Ok::<_, testresult::TestError>(())
         }
@@ -857,14 +855,14 @@ mod tests {
 
             // Remote aborted the connection.
             let res = stream.recv_msg().await;
-            assert!(matches!(res, Err(StreamError::Aborted)));
+            check!(let Err(StreamError::Aborted) = res);
             let res = stream.recv_msg().await;
-            assert!(matches!(res, Err(StreamError::Aborted)));
+            check!(let Err(StreamError::Aborted) = res);
 
             let res = stream.send_msg(b"hello".as_ref().into()).await;
-            assert!(matches!(res, Err(StreamError::Aborted)));
+            check!(let Err(StreamError::Aborted) = res);
             let res = stream.send_msg(b"hello".as_ref().into()).await;
-            assert!(matches!(res, Err(StreamError::Aborted)));
+            check!(matches!(res, Err(StreamError::Aborted)));
 
             Ok::<_, testresult::TestError>(())
         }
@@ -895,9 +893,9 @@ mod tests {
             conn.abort().await?;
 
             let res = stream0.send_msg(b"hello".as_ref().into()).await;
-            assert!(matches!(res, Err(StreamError::Aborted)));
+            check!(let Err(StreamError::Aborted) = res);
             let res = stream1.send_msg(b"hello".as_ref().into()).await;
-            assert!(matches!(res, Err(StreamError::Aborted)));
+            check!(matches!(res, Err(StreamError::Aborted)));
 
             Ok::<_, testresult::TestError>(())
         }
@@ -909,7 +907,7 @@ mod tests {
             let conn = Connection::new(conn).await?;
 
             let res = conn.open_stream().await;
-            assert!(res.is_err());
+            check!(res.is_err());
 
             Ok::<_, testresult::TestError>(())
         }
