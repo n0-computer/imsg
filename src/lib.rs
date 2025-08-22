@@ -265,6 +265,7 @@ impl Drop for StreamInner {
             StreamState::Open => self.abort(),
             StreamState::Closed => (),
             StreamState::Aborted => (),
+            StreamState::EndOfStream => self.abort(),
         }
     }
 }
@@ -278,6 +279,7 @@ impl Stream {
             StreamState::Open => (),
             StreamState::Closed => return Err(StreamError::Closed),
             StreamState::Aborted => return Err(StreamError::Aborted),
+            StreamState::EndOfStream => (),
         }
 
         // Check if the connection asked us to abort the stream.  This happens to any
@@ -323,6 +325,7 @@ impl Stream {
             StreamState::Open => (),
             StreamState::Closed => return Err(StreamError::Closed),
             StreamState::Aborted => return Err(StreamError::Aborted),
+            StreamState::EndOfStream => return Err(StreamError::EndOfStream),
         }
 
         // Check if the connection asked us to abort the stream.  This happens to any
@@ -338,7 +341,10 @@ impl Stream {
 
         match inner.reader.next().await {
             Some(Ok(msg)) => Ok(msg),
-            None => Err(StreamError::EndOfStream),
+            None => {
+                inner.state = StreamState::EndOfStream;
+                Err(StreamError::EndOfStream)
+            }
             Some(Err(err)) => {
                 trace!(?err, "stream read error");
                 inner.abort();
@@ -392,6 +398,8 @@ enum StreamState {
     Open,
     Closed,
     Aborted,
+    /// RecvStream is finished, SendStream can still send.
+    EndOfStream,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -831,10 +839,10 @@ mod tests {
             let conn = Connection::new(conn).await?;
             let stream0 = conn.accept_stream().await?;
             stream0.send_msg(b"hello 0".as_ref().into()).await?;
+            stream0.close().await;
             let stream1 = conn.accept_stream().await?;
             stream1.send_msg(b"hello 1".as_ref().into()).await?;
-            let stream2 = conn.accept_stream().await?;
-            stream2.send_msg(b"hello 2".as_ref().into()).await?;
+            stream1.close().await;
 
             conn.close().await?;
 
@@ -848,30 +856,33 @@ mod tests {
             let conn = Connection::new(conn).await?;
             let stream0 = conn.open_stream().await?;
             let stream1 = conn.open_stream().await?;
-            let stream2 = conn.open_stream().await?;
 
-            // Read last stream first
-            let msg = stream2.recv_msg().await?;
-            assert!(&msg == b"hello 2".as_ref());
+            // Accepting a new stream now fails, since we received the connection close.
+            let res = conn.accept_stream().await;
+            assert!(res.is_err()); // TODO: check error code
 
-            // Now we can't send on other streams
+            // Now we can't send on any streams.
             let res = stream0.send_msg(b"msg".as_ref().into()).await;
             assert!(let Err(StreamError::RemoteClosed) = res);
             let res = stream1.send_msg(b"msg".as_ref().into()).await;
             assert!(let Err(StreamError::RemoteClosed) = res);
 
-            // Drain stream0
+            // But can still drain them
             let msg = stream0.recv_msg().await?;
             assert!(&msg == b"hello 0".as_ref());
             let res = stream0.recv_msg().await;
-            check!(let Err(StreamError::EndOfStream) = res);
+            assert!(let Err(StreamError::EndOfStream) = res);
 
             // Close without draining stream1
             conn.close().await?;
 
-            // Stream1 is now closed
+            // Stream1 is now aborted.
             let res = stream1.recv_msg().await;
-            check!(let Err(StreamError::Closed) = res);
+            check!(let Err(StreamError::Aborted) = res);
+
+            // Stream0 is still finished.
+            let res = stream0.recv_msg().await;
+            assert!(let Err(StreamError::EndOfStream) = res);
 
             Ok::<_, testresult::TestError>(())
         }
