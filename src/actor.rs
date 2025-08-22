@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use iroh::endpoint::{RecvStream, SendStream};
+use iroh::endpoint::{ConnectionError, ReadError, RecvStream, SendStream};
 use n0_future::{SinkExt, StreamExt};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::codec::{FramedRead, FramedWrite};
-use tracing::debug;
+use tracing::{error, instrument, trace};
 
 use crate::proto::{ConnectionErrorCode, ControlFrame, ImsgCodec};
+use crate::{ImsgCodecError, StreamErrorCode};
 
 /// Actor monitoring a connection.
 #[derive(Debug)]
@@ -18,11 +19,14 @@ pub(super) struct ConnectionActor {
     side: super::Side,
     ctrl_writer: FramedWrite<SendStream, ImsgCodec>,
     ctrl_reader: FramedRead<RecvStream, ImsgCodec>,
-    /// All streams.
+    /// Notifier to abort all streams.
     ///
-    /// If the [`Arc::strong_count`] drops to 1 the stream is closed.
+    /// Each stream adds itself to be notified here on creation, when a stream needs to be
+    /// aborted the actor will use this notifier.  If the [`Arc::strong_count`] drops to 1
+    /// the stream is closed.
+    // TODO: Can this use a weak reference instead?
     streams: Vec<Arc<Notify>>,
-    /// Whether the remote is closed this connection.
+    /// Whether the remote has closed this connection.
     ///
     /// This connection/actor now awaits for the user to close the connection locally:
     ///
@@ -37,6 +41,8 @@ pub(super) struct ConnectionActor {
     /// - The server is now waiting for the [`ControlFrame::ConnectionClose`] message from
     ///   the client.
     local_closed: bool,
+    /// Waiters to wake up [`Connection::close`] calls.
+    close_waiters: Vec<oneshot::Sender<()>>,
 }
 
 impl ConnectionActor {
@@ -54,19 +60,21 @@ impl ConnectionActor {
             streams: Vec::new(),
             remote_closed: false,
             local_closed: false,
+            close_waiters: Vec::new(),
         }
     }
 
     pub(super) async fn run(&mut self, mut inbox: mpsc::Receiver<ConnectionActorMessage>) {
-        loop {
+        let conn_close_code = loop {
             tokio::select! {
                 biased;
                 msg = inbox.recv() => {
                     let Some(msg) = msg else {
                         // Inbox closed, all connection objects dropped.
-                        break; // TODO
+                        break ConnectionErrorCode::Closed;
                     };
                     if let Some(frame) = self.handle_inbox(msg) {
+                        trace!(?frame, "sending control msg");
                         let mut buf = BytesMut::with_capacity(8);
                         frame.encode(&mut buf);
                         // TODO: no await
@@ -77,23 +85,85 @@ impl ConnectionActor {
                     }
                 }
                 msg = self.ctrl_reader.next() => {
-                    let Some(msg) = msg else {
-                        // Remote closed the connection.
-                        break;  // TODO
-                    };
-                    self.handle_ctrl_frame(msg.expect("TODO: ctrl stream invalid msg"));
+                    match msg {
+                        Some(Ok(msg)) => self.handle_ctrl_frame(msg),
+                        Some(Err(err)) => break self.handle_ctrl_read_err(err),
+                        None => break ConnectionErrorCode::Closed,
+                    }
                 }
-                reason = self.connection.closed() => {
-                    debug!(?reason, "connection closed");
-                    break;  // TODO
+                // We could also wait on self.connection.closed() here but we already do
+                // this by reading from the control stream, which receives the same
+                // ConnectionError on a connection close.
+            }
+        };
+
+        // No need to explicitly abort the streams, closing the connection will do that.  We
+        // also never finish the control stream.
+        self.connection
+            .close(conn_close_code.into(), b"actor finished");
+        trace!(?conn_close_code, "actor finished");
+    }
+
+    /// Handles an actor message.
+    ///
+    /// Optionally returns a message to be sent on the control stream.
+    fn handle_inbox(&mut self, msg: ConnectionActorMessage) -> Option<ControlFrame> {
+        // trace!(?msg, "actor message");
+        match msg {
+            ConnectionActorMessage::NewStream(notify) => {
+                // Clean up any closed streams first.
+                self.streams.retain(|n| Arc::strong_count(n) > 1);
+                self.streams.push(notify);
+                None
+            }
+            ConnectionActorMessage::Close(tx) => {
+                trace!(?self.local_closed, ?self.remote_closed, "starting connection close");
+                // Store the waker for this close call.
+                self.close_waiters.push(tx);
+
+                // Abort all the streams.  If a stream was already closed but not yet
+                // dropped it will simply ignore this signal.
+                for notify in self.streams.drain(..) {
+                    notify.notify_one();
                 }
+
+                self.local_closed = true;
+                if self.remote_closed {
+                    // Close the connection
+                    match self.side {
+                        crate::Side::Server => {
+                            trace!("closing connection");
+                            self.connection
+                                .close(ConnectionErrorCode::Closed.into(), b"closed");
+                            for tx in self.close_waiters.drain(..) {
+                                tx.send(()).ok();
+                            }
+                            None
+                        }
+                        crate::Side::Client => Some(ControlFrame::ConnectionClose),
+                    }
+                } else {
+                    match self.side {
+                        crate::Side::Server => Some(ControlFrame::RequestConnectionClose),
+                        crate::Side::Client => Some(ControlFrame::ConnectionClose),
+                    }
+                }
+            }
+            ConnectionActorMessage::Abort(tx) => {
+                for notify in self.streams.drain(..) {
+                    notify.notify_one();
+                }
+                tx.send(()).ok();
+                None
             }
         }
     }
 
     fn handle_ctrl_frame(&mut self, mut msg: Bytes) {
+        // TODO: close conn with protocol violation on invalid frame
         let frame = ControlFrame::decode(&mut msg).expect("TODO");
         assert!(msg.is_empty(), "TODO: invalid control message");
+        trace!(?frame, ?self.local_closed, ?self.remote_closed, "handling control frame");
         match frame {
             ControlFrame::RequestConnectionClose => {
                 assert!(
@@ -109,62 +179,74 @@ impl ConnectionActor {
                 );
                 self.remote_closed = true;
                 if self.local_closed {
+                    trace!("closing connection");
                     self.connection
-                        .close(ConnectionErrorCode::Closed.into(), b"close".as_ref());
+                        .close(ConnectionErrorCode::Closed.into(), b"closed");
+                    for notify in self.close_waiters.drain(..) {
+                        notify.send(()).ok();
+                    }
                 }
             }
         }
     }
 
-    /// Handles an actor message.
+    /// Handles a read error from the control stream.
     ///
-    /// Optionally returns a message to be sent on the control stream.
-    fn handle_inbox(&mut self, msg: ConnectionActorMessage) -> Option<ControlFrame> {
-        match msg {
-            ConnectionActorMessage::NewStream(notify) => {
-                // Clean up any closed streams first.
-                self.streams.retain(|n| Arc::strong_count(n) > 1);
-                self.streams.push(notify);
-                None
-            }
-            ConnectionActorMessage::Close(tx) => {
-                // First abort all the connections.  If a stream was already closed but not
-                // yet dropped it will simply ignore this signal.
-                for notify in self.streams.drain(..) {
-                    notify.notify_one();
+    /// We always close the connection after a read error.  This is responsible for figuring
+    /// out the error code and log the read error at an appropriate level.
+    #[instrument(skip(self))]
+    fn handle_ctrl_read_err(&mut self, err: ImsgCodecError) -> ConnectionErrorCode {
+        let mut stream_error = None;
+        let mut conn_error = None;
+
+        let close_code = match err {
+            ImsgCodecError::CodecError => ConnectionErrorCode::ProtocolError,
+            ImsgCodecError::IoError(error) => match error.downcast::<ReadError>() {
+                Ok(ReadError::Reset(code)) => {
+                    match StreamErrorCode::try_from(code) {
+                        Ok(code) => stream_error = Some(code),
+                        Err(code) => error!(%code, "invalid StreamErrorCode"),
+                    }
+                    ConnectionErrorCode::ProtocolError
                 }
-
-                // We cheat, and tell our connection object that we did close.  It can't
-                // tell the difference between it being on the wire or that we haven't
-                // sent this yet.
-                tx.send(()).ok();
-
-                if self.remote_closed {
-                    // Close the connection
-                    match self.side {
-                        crate::Side::Server => {
-                            self.connection
-                                .close(ConnectionErrorCode::Closed.into(), b"close".as_ref());
-                            None
+                Ok(ReadError::ConnectionLost(ConnectionError::ApplicationClosed(close))) => {
+                    match ConnectionErrorCode::try_from(close.error_code) {
+                        Ok(code) => {
+                            conn_error = Some(code);
+                            match code {
+                                ConnectionErrorCode::Closed => ConnectionErrorCode::Closed,
+                                _ => ConnectionErrorCode::ProtocolError,
+                            }
                         }
-                        crate::Side::Client => Some(ControlFrame::ConnectionClose),
+                        Err(code) => {
+                            error!(%code, "invalid ConnectionErrorCode");
+                            ConnectionErrorCode::ProtocolError
+                        }
                     }
-                } else {
-                    self.local_closed = true;
-                    match self.side {
-                        crate::Side::Server => Some(ControlFrame::RequestConnectionClose),
-                        crate::Side::Client => Some(ControlFrame::ConnectionClose),
-                    }
+                }
+                Ok(_) => ConnectionErrorCode::ProtocolError,
+                Err(err) => {
+                    error!(?err, "downcast to ReadError failed");
+                    // TODO: Maybe this should be unreachable!()?
+                    ConnectionErrorCode::ImplementationError
+                }
+            },
+        };
+
+        match close_code {
+            ConnectionErrorCode::Closed => {
+                trace!("connection closed");
+                for tx in self.close_waiters.drain(..) {
+                    tx.send(()).ok();
                 }
             }
-            ConnectionActorMessage::Abort(tx) => {
-                for notify in self.streams.drain(..) {
-                    notify.notify_one();
-                }
-                tx.send(()).ok();
-                None
+            _ => {
+                trace!(?conn_error, ?stream_error, "connection failure");
+                self.close_waiters.drain(..);
             }
         }
+
+        close_code
     }
 }
 

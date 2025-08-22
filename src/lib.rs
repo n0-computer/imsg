@@ -15,13 +15,13 @@ use std::sync::Arc;
 use actor::{ConnectionActor, ConnectionActorMessage};
 use anyhow::{Context, Result, anyhow, ensure};
 use bytes::{Bytes, BytesMut};
-use iroh::endpoint::{RecvStream, SendStream};
+use iroh::endpoint::{ConnectionError, RecvStream, SendStream};
 use n0_future::task::AbortOnDropHandle;
 use n0_future::{SinkExt, StreamExt, future};
-use proto::{ImsgCodec, ImsgCodecError, StreamErrorCode, StreamType};
+use proto::{ConnectionErrorCode, ImsgCodec, ImsgCodecError, StreamErrorCode, StreamType};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio_util::codec::{FramedRead, FramedWrite};
-use tracing::{Instrument, info_span};
+use tracing::{Instrument, error, info_span, instrument, trace};
 
 mod actor;
 mod proto;
@@ -53,6 +53,7 @@ impl Connection {
         let mut ctrl_writer = FramedWrite::new(ctrl_send, ImsgCodec);
         let mut ctrl_reader = FramedRead::new(ctrl_recv, ImsgCodec);
 
+        // Read or send the StreamType message that opens the control stream.
         match side {
             Side::Server => {
                 // Read the StreamType.
@@ -174,14 +175,26 @@ impl Connection {
     /// will still be able to be read by the peer before the connection is fully closed.
     ///
     /// Any streams still open when this is called will be aborted immediately.
+    // TODO: I worry that indefinitely hanging is too big a footgun.
     pub async fn close(&self) -> Result<()> {
-        // - abort all not-yet-closed streams
-        // - open the "closing/control stream" to do closing handshake
+        if let Some(conn_err) = self.conn.close_reason() {
+            return match conn_err {
+                ConnectionError::ApplicationClosed(application_close)
+                    if application_close.error_code == ConnectionErrorCode::Closed.into() =>
+                {
+                    Ok(())
+                }
+                // TODO: handle remote aborted here with an Aborted error variant
+                _ => Err(anyhow!("connection error: {conn_err:?}")),
+            };
+        }
+
         let (tx, rx) = oneshot::channel();
         self.actor_addr
             .send(ConnectionActorMessage::Close(tx))
-            .await?;
-        rx.await?;
+            .await
+            .context("hello actor inbox")?;
+        rx.await.context("TODO: ConnectionError::Aborted")?;
         Ok(())
     }
 
@@ -225,19 +238,36 @@ struct StreamInner {
 }
 
 impl StreamInner {
-    async fn abort(&mut self) -> Result<()> {
+    /// Aborts the stream.
+    ///
+    /// Can be safely called whatever the state of the stream, does nothing if the stream is
+    /// already closed.
+    fn abort(&mut self) {
         self.writer
             .get_mut()
-            .reset(StreamErrorCode::Aborted.into())?;
+            .reset(StreamErrorCode::Aborted.into())
+            .ok();
         self.reader
             .get_mut()
-            .stop(StreamErrorCode::Aborted.into())?;
-        Ok(())
+            .stop(StreamErrorCode::Aborted.into())
+            .ok();
+        self.state = StreamState::Aborted
+    }
+}
+
+impl Drop for StreamInner {
+    fn drop(&mut self) {
+        match self.state {
+            StreamState::Open => self.abort(),
+            StreamState::Closed => (),
+            StreamState::Aborted => (),
+        }
     }
 }
 
 impl Stream {
     /// Sends a message to the peer.
+    #[instrument(skip_all)]
     pub async fn send_msg(&self, msg: Bytes) -> Result<(), StreamError> {
         let mut inner = self.inner.lock().await;
         match inner.state {
@@ -246,21 +276,28 @@ impl Stream {
             StreamState::Aborted => return Err(StreamError::Aborted),
         }
 
-        // We only have to actively abort the stream when it first happens.
+        // Check if the connection asked us to abort the stream.  This happens to any
+        // streams still open when Connection::close is called.
         if future::poll_once(inner.abort_requested.notified())
             .await
             .is_some()
         {
             inner.state = StreamState::Aborted;
-            inner.abort().await.map_err(|_| StreamError::Aborted)?;
+            inner.abort();
             return Err(StreamError::Aborted);
         }
 
-        inner.writer.send(msg).await?;
-        Ok(())
+        match inner.writer.send(msg).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                trace!(?err, "stream write error");
+                Err(StreamError::Aborted)
+            }
+        }
     }
 
     /// Receives a message from the peer.
+    #[instrument(skip_all)]
     pub async fn recv_msg(&self) -> Result<Bytes, StreamError> {
         let mut inner = self.inner.lock().await;
         match inner.state {
@@ -269,20 +306,25 @@ impl Stream {
             StreamState::Aborted => return Err(StreamError::Aborted),
         }
 
-        // We only have to actively abort the stream when it first happens.
+        // Check if the connection asked us to abort the stream.  This happens to any
+        // streams still open when Connection::close is called.
         if future::poll_once(inner.abort_requested.notified())
             .await
             .is_some()
         {
             inner.state = StreamState::Aborted;
-            inner.abort().await.map_err(|_| StreamError::Aborted)?;
+            inner.abort();
             return Err(StreamError::Aborted);
         }
 
-        // TODO: ReadError::Reset -> aborted; ReadError::ClosedStream -> closed
         match inner.reader.next().await {
-            Some(ret) => Ok(ret?),
+            Some(Ok(msg)) => Ok(msg),
             None => Err(StreamError::EndOfStream),
+            Some(Err(err)) => {
+                trace!(?err, "stream read error");
+                inner.abort();
+                Err(StreamError::Aborted)
+            }
         }
     }
 
@@ -318,8 +360,8 @@ impl Stream {
     ///
     /// Sending and receiving messages will fail immediately.  This is the equivalent of
     /// dropping the stream.
-    pub async fn abort(&self) -> Result<()> {
-        self.inner.lock().await.abort().await
+    pub async fn abort(&self) {
+        self.inner.lock().await.abort()
     }
 }
 
@@ -348,7 +390,10 @@ pub enum StreamError {
     /// The peer has closed the stream.
     ///
     /// Any messages already sent by the peer can still be received.  Sending messages is no
-    /// longer possible.
+    /// longer possible.  This error is only returned when sending a message, when receiving
+    /// messages continue to be returned until [`EndOfStream`] is returned.
+    ///
+    /// [`EndOfStream`]: StreamError::EndOfStream
     #[error("remote closed stream")]
     RemoteClosed,
     /// The stream is closed.
@@ -362,15 +407,17 @@ pub enum StreamError {
     /// stream was aborted before the [`EndOfStream`] was reached.
     ///
     /// [`EndOfStream`]: StreamError::EndOfStream
+    // Implementation note: an imsg protocol error is surfaced to the user as an Aborted
+    // stream.  To debug this you'll need to
     #[error("stream aborted")]
     Aborted,
 }
 
-impl From<ImsgCodecError> for StreamError {
-    fn from(_: ImsgCodecError) -> Self {
-        Self::Aborted
-    }
-}
+// impl From<ImsgCodecError> for StreamError {
+//     fn from(err: ImsgCodecError) -> Self {
+//         Self::Aborted
+//     }
+// }
 
 /// What side of a connection we are.
 #[derive(Debug, Copy, Clone)]
@@ -404,10 +451,11 @@ impl From<iroh::endpoint::StreamId> for Side {
 #[cfg(test)]
 mod tests {
     use anyhow::anyhow;
-    use assert2::check;
+    use assert2::{assert, check};
     use iroh::{Endpoint, Watcher};
     use testresult::TestResult;
     use tracing::{Instrument, info_span};
+    use tracing_test::traced_test;
 
     use super::*;
 
@@ -461,6 +509,7 @@ mod tests {
     // }
 
     #[tokio::test]
+    #[traced_test]
     async fn test_basic_echo() -> TestResult {
         let alice = Endpoint::builder()
             .alpns(vec![ALPN.to_vec()])
@@ -505,6 +554,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn test_stream_not_closed() -> TestResult {
         let alice = Endpoint::builder()
             .alpns(vec![ALPN.to_vec()])
@@ -549,6 +599,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn test_conn_dropped() -> TestResult {
         let alice = Endpoint::builder()
             .alpns(vec![ALPN.to_vec()])
@@ -595,6 +646,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn test_conn_dropped_msg_loss() -> TestResult {
         let alice = Endpoint::builder()
             .alpns(vec![ALPN.to_vec()])
@@ -637,6 +689,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn test_accept_stream_first_message() -> TestResult {
         let alice = Endpoint::builder()
             .alpns(vec![ALPN.to_vec()])
@@ -677,6 +730,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn test_close() -> TestResult {
         let alice = Endpoint::builder()
             .alpns(vec![ALPN.to_vec()])
@@ -743,6 +797,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn test_close_multiple_streams() -> TestResult {
         let alice = Endpoint::builder()
             .alpns(vec![ALPN.to_vec()])
@@ -777,17 +832,17 @@ mod tests {
 
             // Read last stream first
             let msg = stream2.recv_msg().await?;
-            check!(&msg == b"hello 2".as_ref());
+            assert!(&msg == b"hello 2".as_ref());
 
             // Now we can't send on other streams
             let res = stream0.send_msg(b"msg".as_ref().into()).await;
-            check!(let Err(StreamError::RemoteClosed) = res);
+            assert!(let Err(StreamError::RemoteClosed) = res);
             let res = stream1.send_msg(b"msg".as_ref().into()).await;
-            check!(let Err(StreamError::RemoteClosed) = res);
+            assert!(let Err(StreamError::RemoteClosed) = res);
 
             // Drain stream0
             let msg = stream0.recv_msg().await?;
-            check!(&msg == b"hello 0".as_ref());
+            assert!(&msg == b"hello 0".as_ref());
             let res = stream0.recv_msg().await;
             check!(let Err(StreamError::EndOfStream) = res);
 
@@ -810,6 +865,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn test_abort() -> TestResult {
         let alice = Endpoint::builder()
             .alpns(vec![ALPN.to_vec()])
@@ -846,11 +902,11 @@ mod tests {
             let conn = Connection::new(conn).await?;
             let stream = conn.open_stream().await?;
 
-            // This may or may not work, depending on timing.
+            // This may or may not succeed, depending on timing.
             match stream.send_msg(b"hello".as_ref().into()).await {
                 Ok(()) => (),
                 Err(StreamError::Aborted) => (),
-                Err(_) => panic!("wrong error"),
+                Err(err) => panic!("wrong error: {err:?}"),
             }
 
             // Remote aborted the connection.
@@ -876,6 +932,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn test_abort_stream_clone() -> TestResult {
         let alice = Endpoint::builder()
             .alpns(vec![ALPN.to_vec()])

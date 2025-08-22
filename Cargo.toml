@@ -22,3 +22,4 @@ tracing = "0.1.41"
 [dev-dependencies]
 assert2 = "0.3.16"
 testresult = "0.4.1"
+tracing-test = "0.2.5"

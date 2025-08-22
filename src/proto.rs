@@ -42,6 +42,12 @@ impl StreamType {
 }
 
 /// Frames sent on a control stream.
+///
+/// The control stream is the first stream opened, using the [`StreamType::Control`] stream
+/// type.
+///
+/// The stream is never explicitly finished, reset (for [`SendStream`] or stopped (for
+/// [`RecvStream`].
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u32)]
 pub(super) enum ControlFrame {
@@ -83,7 +89,7 @@ impl ControlFrame {
     }
 }
 
-/// Error codes for streams.
+/// Error codes for streams, both user and control streams.
 ///
 /// To be used when resetting [`SendStream`] or stopping a [`RecvStream`].
 ///
@@ -97,21 +103,37 @@ pub(super) enum StreamErrorCode {
     /// We should not do this, but this is what Quinn uses by default.
     #[allow(dead_code)]
     Dropped = 0,
+    /// The stream was closed.
+    Closed = 1,
+    /// the stream was aborted.
+    Aborted = 2,
     /// This control stream is not needed.
     ///
     /// Used for the control stream opened by the server, which is not needed.
-    ControlStreamNotNeeded = 1,
-    // /// Error in the imsg protocol.
-    // ProtocolError = 2,
-    /// The stream was closed.
-    Closed = 3,
-    /// the stream was aborted.
-    Aborted = 4,
+    ControlStreamNotNeeded = 3,
+    /// Error in the imsg protocol.
+    ProtocolError = 4,
 }
 
 impl From<StreamErrorCode> for iroh::endpoint::VarInt {
     fn from(source: StreamErrorCode) -> Self {
         iroh::endpoint::VarInt::from(source as u32)
+    }
+}
+
+impl TryFrom<iroh::endpoint::VarInt> for StreamErrorCode {
+    type Error = u64;
+
+    fn try_from(value: iroh::endpoint::VarInt) -> std::result::Result<Self, Self::Error> {
+        let value = u64::from(value);
+        match value {
+            0 => Ok(Self::Dropped),
+            1 => Ok(Self::Closed),
+            2 => Ok(Self::Aborted),
+            3 => Ok(Self::ControlStreamNotNeeded),
+            4 => Ok(Self::ProtocolError),
+            _ => Err(value),
+        }
     }
 }
 
@@ -126,11 +148,33 @@ pub(super) enum ConnectionErrorCode {
     Dropped = 0,
     /// The connection was closed orderly.
     Closed = 1,
+    /// The connection was aborted.
+    Aborted = 2,
+    /// Error in the imsg protocol.
+    ProtocolError = 3,
+    /// An error in the implementation.
+    ImplementationError = 4,
 }
 
 impl From<ConnectionErrorCode> for iroh::endpoint::VarInt {
     fn from(value: ConnectionErrorCode) -> Self {
         iroh::endpoint::VarInt::from(value as u32)
+    }
+}
+
+impl TryFrom<iroh::endpoint::VarInt> for ConnectionErrorCode {
+    type Error = u64;
+
+    fn try_from(value: iroh::endpoint::VarInt) -> std::result::Result<Self, Self::Error> {
+        let value = u64::from(value);
+        match value {
+            0 => Ok(Self::Dropped),
+            1 => Ok(Self::Closed),
+            2 => Ok(Self::Aborted),
+            3 => Ok(Self::ProtocolError),
+            4 => Ok(Self::ImplementationError),
+            _ => Err(value),
+        }
     }
 }
 
