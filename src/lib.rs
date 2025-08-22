@@ -15,7 +15,7 @@ use std::sync::Arc;
 use actor::{ConnectionActor, ConnectionActorMessage};
 use anyhow::{Context, Result, anyhow, ensure};
 use bytes::{Bytes, BytesMut};
-use iroh::endpoint::{ConnectionError, RecvStream, SendStream};
+use iroh::endpoint::{ConnectionError, RecvStream, SendStream, WriteError};
 use n0_future::task::AbortOnDropHandle;
 use n0_future::{SinkExt, StreamExt, future};
 use proto::{ConnectionErrorCode, ImsgCodec, ImsgCodecError, StreamErrorCode, StreamType};
@@ -291,6 +291,21 @@ impl Stream {
             Ok(()) => Ok(()),
             Err(err) => {
                 trace!(?err, "stream write error");
+
+                // Handle a remotely closed stream.  Stream::close() stops their RecvStream
+                // (our SendStream) and finishes their SendStream (our RecvStream).
+                if let ImsgCodecError::IoError(io_err) = err {
+                    if let Ok(WriteError::Stopped(code)) = io_err.downcast() {
+                        if let Ok(code) = StreamErrorCode::try_from(code) {
+                            trace!(?code, "write stream stopped");
+                            if let StreamErrorCode::Closed = code {
+                                return Err(StreamError::RemoteClosed);
+                            }
+                        }
+                    }
+                }
+
+                // Everything else results in Aborted.
                 Err(StreamError::Aborted)
             }
         }
@@ -731,7 +746,7 @@ mod tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn test_close() -> TestResult {
+    async fn test_close_stream() -> TestResult {
         let alice = Endpoint::builder()
             .alpns(vec![ALPN.to_vec()])
             .bind()
@@ -748,15 +763,15 @@ mod tests {
 
             // Reading now results in a Closed error
             let res = stream.recv_msg().await;
-            assert!(matches!(res, Err(StreamError::Closed)));
+            assert!(let Err(StreamError::Closed) = res);
 
             // Sending now results in a closed error
             let res = stream.send_msg(b"hello".as_ref().into()).await;
-            check!(let Err(StreamError::Closed) = res);
+            assert!(let Err(StreamError::Closed) = res);
 
             // For implementation reasons, check this result is consistent.
             let res = stream.send_msg(b"hello".as_ref().into()).await;
-            check!(let Err(StreamError::Closed) = res);
+            assert!(let Err(StreamError::Closed) = res);
 
             conn.close().await?;
 
@@ -772,15 +787,15 @@ mod tests {
 
             // First read a message
             let msg = stream.recv_msg().await?;
-            check!(&msg == b"hello".as_ref());
+            assert!(&msg == b"hello".as_ref());
 
             // Now read end-of-stream
             let res = stream.recv_msg().await;
-            check!(let Err(StreamError::EndOfStream) = res);
+            assert!(let Err(StreamError::EndOfStream) = res);
 
             // Sending does not work since remote has closed.
             let res = stream.send_msg(b"hello".as_ref().into()).await;
-            check!(let Err(StreamError::RemoteClosed) = res);
+            assert!(let Err(StreamError::RemoteClosed) = res);
 
             stream.close().await?;
             conn.close().await?;
