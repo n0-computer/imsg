@@ -983,8 +983,10 @@ mod tests {
 
             let conn = Connection::new(conn).await?;
 
-            let res = conn.open_stream().await;
-            check!(res.is_err());
+            let stream = conn.open_stream().await?;
+
+            let res = stream.recv_msg().await;
+            check!(let Err(StreamError::Aborted) = res);
 
             Ok::<_, testresult::TestError>(())
         }
