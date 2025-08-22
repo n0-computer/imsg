@@ -70,12 +70,14 @@ impl Connection {
                     matches!(stream_type, StreamType::Control),
                     "expected control stream"
                 );
+                trace!(StreamType = ?stream_type, "connection accepted");
             }
             Side::Client => {
                 // Send the StreamType.
                 let mut buf = BytesMut::with_capacity(8);
                 StreamType::Control.encode(&mut buf);
                 ctrl_writer.send(buf.freeze()).await?;
+                trace!(StreamType = ?StreamType::Control, "connection started");
             }
         }
 
@@ -112,6 +114,7 @@ impl Connection {
         let mut buf = BytesMut::with_capacity(8);
         StreamType::User.encode(&mut buf);
         writer.send(buf.freeze()).await?;
+        trace!(StreamType=?StreamType::User, "opened stream");
 
         // Send the abort hook to the connection actor.
         let notify = Arc::new(Notify::new());
@@ -151,6 +154,7 @@ impl Connection {
             matches!(stream_type, StreamType::User),
             "expected user stream"
         );
+        trace!(StreamType = ?stream_type, "accepted stream");
 
         // Send the abort hook to the connection actor.
         let notify = Arc::new(Notify::new());
@@ -297,7 +301,7 @@ impl Stream {
                 if let ImsgCodecError::IoError(io_err) = err {
                     if let Ok(WriteError::Stopped(code)) = io_err.downcast() {
                         if let Ok(code) = StreamErrorCode::try_from(code) {
-                            trace!(?code, "write stream stopped");
+                            trace!(StreamErrorCode=?code, "write stream stopped");
                             if let StreamErrorCode::Closed = code {
                                 return Err(StreamError::RemoteClosed);
                             }

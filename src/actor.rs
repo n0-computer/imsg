@@ -101,7 +101,7 @@ impl ConnectionActor {
         // also never finish the control stream.
         self.connection
             .close(conn_close_code.into(), b"actor finished");
-        trace!(?conn_close_code, "actor finished");
+        trace!(ConnectionErrorCode = ?conn_close_code, "actor finished");
     }
 
     /// Handles an actor message.
@@ -223,6 +223,9 @@ impl ConnectionActor {
                             ConnectionErrorCode::ProtocolError
                         }
                     }
+                }
+                Ok(ReadError::ConnectionLost(ConnectionError::LocallyClosed)) => {
+                    ConnectionErrorCode::Closed
                 }
                 Ok(_) => ConnectionErrorCode::ProtocolError,
                 Err(err) => {
