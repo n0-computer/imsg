@@ -998,4 +998,46 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_abort_conn() -> TestResult {
+        let alice = Endpoint::builder()
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await?;
+        let alice_addr = alice.node_addr().initialized().await;
+
+        let alice_fut = async move {
+            let conn = alice.accept().await.ok_or(anyhow!("no conn"))?.await?;
+
+            let conn = Connection::new(conn).await?;
+            let _stream = conn.accept_stream().await?;
+
+            conn.abort().await?;
+
+            Ok::<_, testresult::TestError>(())
+        }
+        .instrument(info_span!("alice"));
+        let bob_fut = async move {
+            let bob = Endpoint::builder().bind().await?;
+            let conn = bob.connect(alice_addr, ALPN).await?;
+
+            let conn = Connection::new(conn).await?;
+            let _stream = conn.open_stream().await?;
+
+            let res = conn.accept_stream().await;
+            // TODO: Check an actual error type.
+            check!(res.is_err());
+
+            Ok::<_, testresult::TestError>(())
+        }
+        .instrument(info_span!("bob"));
+
+        let (alice_ret, bob_ret) = tokio::join!(alice_fut, bob_fut);
+        alice_ret?;
+        bob_ret?;
+
+        Ok(())
+    }
 }

@@ -154,6 +154,10 @@ impl ConnectionActor {
                     notify.notify_one();
                 }
                 tx.send(()).ok();
+                trace!("aborting connection");
+                self.connection
+                    .close(ConnectionErrorCode::Aborted.into(), b"aborted");
+                self.close_waiters.drain(..);
                 None
             }
         }
@@ -215,6 +219,7 @@ impl ConnectionActor {
                             conn_error = Some(code);
                             match code {
                                 ConnectionErrorCode::Closed => ConnectionErrorCode::Closed,
+                                ConnectionErrorCode::Aborted => ConnectionErrorCode::Aborted,
                                 _ => ConnectionErrorCode::ProtocolError,
                             }
                         }
@@ -242,6 +247,10 @@ impl ConnectionActor {
                 for tx in self.close_waiters.drain(..) {
                     tx.send(()).ok();
                 }
+            }
+            ConnectionErrorCode::Aborted => {
+                trace!("connection aborted");
+                self.close_waiters.drain(..);
             }
             _ => {
                 trace!(?conn_error, ?stream_error, "connection failure");
