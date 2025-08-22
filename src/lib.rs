@@ -352,7 +352,7 @@ impl Stream {
     /// already sent messages if it has not yet closed the stream itself.
     ///
     /// Once closed, it is safe to drop the stream.
-    pub async fn close(&self) -> Result<()> {
+    pub async fn close(&self) {
         let mut inner = self.inner.lock().await;
         inner.state = StreamState::Closed;
         // If the peer already closed it would have stopped our SendStream and finished our
@@ -368,7 +368,6 @@ impl Stream {
             .get_mut()
             .stop(StreamErrorCode::Closed.into())
             .ok();
-        Ok(())
     }
 
     /// Aborts the stream, messages might be lost.
@@ -539,7 +538,7 @@ mod tests {
             let stream = conn.accept_stream().await?;
             let msg = stream.recv_msg().await?;
             stream.send_msg(msg).await?;
-            stream.close().await?;
+            stream.close().await;
             conn.close().await?;
 
             Ok::<_, testresult::TestError>(())
@@ -554,7 +553,7 @@ mod tests {
             stream.send_msg(b"hello".as_ref().into()).await?;
             let msg = stream.recv_msg().await?;
             check!(&msg == b"hello".as_ref());
-            stream.close().await?;
+            stream.close().await;
             conn.close().await?;
 
             Ok::<_, testresult::TestError>(())
@@ -629,7 +628,7 @@ mod tests {
             let stream = conn.accept_stream().await?;
             let msg = stream.recv_msg().await?;
             stream.send_msg(msg).await?;
-            stream.close().await?;
+            stream.close().await;
             // Dropping the connection without closing.  No messages lost because we awaited
             // the stream.  A warning is logged.
 
@@ -645,7 +644,7 @@ mod tests {
             stream.send_msg(b"hello".as_ref().into()).await?;
             let msg = stream.recv_msg().await?;
             check!(&msg == b"hello".as_ref());
-            stream.close().await?;
+            stream.close().await;
             // Dropping the connection without closing.  No message lost because we awaited
             // the stream.  A warning is logged.
 
@@ -759,7 +758,7 @@ mod tests {
             let conn = Connection::new(conn).await?;
             let stream = conn.accept_stream().await?;
             stream.send_msg(b"hello".as_ref().into()).await?;
-            stream.close().await?;
+            stream.close().await;
 
             // Reading now results in a Closed error
             let res = stream.recv_msg().await;
@@ -792,12 +791,14 @@ mod tests {
             // Now read end-of-stream
             let res = stream.recv_msg().await;
             assert!(let Err(StreamError::EndOfStream) = res);
+            let res = stream.recv_msg().await;
+            assert!(let Err(StreamError::EndOfStream) = res);
 
             // Sending does not work since remote has closed.
             let res = stream.send_msg(b"hello".as_ref().into()).await;
             assert!(let Err(StreamError::RemoteClosed) = res);
 
-            stream.close().await?;
+            stream.close().await;
             conn.close().await?;
 
             Ok::<_, testresult::TestError>(())
